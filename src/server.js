@@ -7,6 +7,7 @@ const db = require('./db');
 const { wsConnection } = require('./ws');
 const { getRoom } = require('./room');
 const { compact, recoverFromStore } = require('./compaction');
+const { duplicateDocument, validateTitle, validateRequestedId } = require('./duplicate');
 const { resolveToken, getActiveRole } = require('./permissions');
 const yutil = require('./yutil');
 
@@ -39,6 +40,41 @@ async function buildServer() {
       minUpdates: req.body?.minUpdates || 1,
     });
     return out;
+  });
+
+  // Duplicate the current document: fork the room's consistent Yjs state
+  // into a new same-tenant document whose only member is the requester
+  // (as owner). Copies state only — no update history, no other members.
+  app.post('/v1/docs/:docId/duplicate', async (req, reply) => {
+    const token = req.headers['x-auth-token'];
+    const session = await resolveToken(Array.isArray(token) ? token[0] : token);
+    if (!session) return reply.code(401).send({ error: 'BAD_TOKEN' });
+    const role = await getActiveRole(session.user_id, req.params.docId);
+    if (!role || role.tenant_id !== session.tenant_id) {
+      return reply.code(403).send({ error: 'FORBIDDEN' });
+    }
+    if (role.role === 'reader') return reply.code(403).send({ error: 'READ_ONLY' });
+
+    // Validate BEFORE any write: rejected requests must leave nothing behind.
+    const title = validateTitle(req.body?.title);
+    if (!title) return reply.code(400).send({ error: 'INVALID_TITLE' });
+    const requestedId = req.body?.docId;
+    if (requestedId !== undefined && requestedId !== null && !validateRequestedId(requestedId)) {
+      return reply.code(400).send({ error: 'INVALID_DOC_ID' });
+    }
+
+    const room = await getRoom(req.params.docId);
+    try {
+      const out = await duplicateDocument(room, {
+        session, title, requestedId: requestedId || null,
+      });
+      return { ok: true, ...out };
+    } catch (e) {
+      if (e.code === 'DOC_ID_TAKEN') {
+        return reply.code(409).send({ error: 'DOC_ID_TAKEN', message: e.message });
+      }
+      throw e;
+    }
   });
 
   // Recovery probe: rebuild the document purely from PostgreSQL

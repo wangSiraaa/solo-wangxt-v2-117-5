@@ -81,8 +81,16 @@ async function processUpdate(ws, room, ctx, payload) {
         [docId],
       );
       if (lock.rowCount === 0) throw new Error('document vanished');
+      // The seq lower bound must also cover the latest snapshot's
+      // through_seq: deleteFolded compaction physically removes folded
+      // rows, and a seq reassigned at or below through_seq would be
+      // skipped by recovery (snapshot + updates with seq > through_seq)
+      // — silent data loss on the next restart.
       const maxRes = await client.query(
-        `SELECT COALESCE(MAX(seq), 0) AS max_seq FROM doc_updates WHERE doc_id = $1`,
+        `SELECT GREATEST(
+           (SELECT COALESCE(MAX(seq), 0) FROM doc_updates WHERE doc_id = $1),
+           (SELECT COALESCE(MAX(through_seq), 0) FROM doc_snapshots WHERE doc_id = $1)
+         ) AS max_seq`,
         [docId],
       );
       seq = Number(maxRes.rows[0].max_seq) + 1;

@@ -21,7 +21,9 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
                             │        1) 帧/二进制校验
                             │        2) 每次 UPDATE 重新查库鉴权
                             │        3) BEGIN; SELECT … FOR UPDATE;
-                            │           seq = max(seq)+1
+                            │           seq = max(存活更新 seq, 最新快照 through_seq)+1
+                            │           （deleteFolded 物理删除旧更新后 seq 也绝不回退，
+                            │             否则新更新会被 snapshot+tail 恢复路径跳过）
                             │           INSERT … ON CONFLICT(doc_id,client_msg_id) DO NOTHING
                             │           COMMIT   ◄── fsync 持久化边界
                             │        4) 内存 apply + 广播给“其他”连接
@@ -76,6 +78,25 @@ hello 和 `sync-req` 都接受 Yjs 状态向量：服务器返回
    文档逐字节相等——直接验证「压缩/删除日志后仍可恢复文档内容」。
 
 恢复永远走 `snapshot(through_seq=N)` + `updates(seq > N)`（T6）。
+
+### 复制当前文档（同租户演练起点）
+
+`POST /v1/docs/:docId/duplicate`（body：`{title, docId?}`）把源 room **当前一致的
+Yjs 状态**物化为一个新文档，用于"以当前文档为起点开一场互不影响的演练"：
+
+1. 在源 room 的串行队列内取一致切口：此刻之前已持久化的更新全部包含，
+   之后的更新不会混入这次复制；
+2. 单个事务写入三行——`documents`（同租户、标题取自请求）、
+   `document_members`（**仅发起者一人，角色 owner**）、
+   `doc_snapshots`（`through_seq=0` 的初始可恢复快照，内容即源文档当前
+   全量状态编码）。任一步失败整体回滚，空标题等无效请求在写库前就被
+   拒绝，不留半成品；
+3. **不搬运更新历史，也不复制原成员**：副本的 `doc_updates` 为空，恢复路径
+   是 `snapshot(0) + updates(seq > 0)`，与压缩后的恢复完全同构（T11）。
+
+复制完成时源与副本的二进制状态哈希相同；此后两者各自编辑、压缩、重启
+恢复，互不影响（T11）。权限与压缩端点一致：reader / 非成员 / 跨租户一律
+拒绝（T12）。
 
 ### 未知 / 损坏更新可定位
 
@@ -191,6 +212,8 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 复制文档：复制瞬间源/副本哈希相同；副本无更新历史、仅发起者为 owner；随后双方各自编辑、压缩（含物理删除）、重启恢复互不串改 |
+| T12 | 复制权限：reader/非成员/跨租户/未知 token 全拒；空标题等无效请求 400 且不留任何半成品行；id 冲突 409 |
 
 ---
 
@@ -205,12 +228,14 @@ src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
+src/duplicate.js         复制当前文档：一致切口 + 新文档/owner/初始快照单事务落库
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
 src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/doc-hash.js      连接任意文档（含副本）并打印状态哈希
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```

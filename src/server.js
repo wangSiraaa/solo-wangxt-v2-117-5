@@ -7,6 +7,7 @@ const db = require('./db');
 const { wsConnection } = require('./ws');
 const { getRoom } = require('./room');
 const { compact, recoverFromStore } = require('./compaction');
+const { copyDocument } = require('./copy');
 const { resolveToken, getActiveRole } = require('./permissions');
 const yutil = require('./yutil');
 
@@ -37,6 +38,35 @@ async function buildServer() {
     const out = await compact(room, {
       deleteFolded: !!req.body?.deleteFolded,
       minUpdates: req.body?.minUpdates || 1,
+    });
+    return out;
+  });
+
+  // Copy the current document into a new document owned solely by the
+  // caller: the copy starts from the source room's consistent Yjs state as
+  // a recoverable initial snapshot. No update history and no memberships
+  // are carried over, so source and copy evolve independently afterwards.
+  app.post('/v1/docs/:docId/copy', async (req, reply) => {
+    const token = req.headers['x-auth-token'];
+    const session = await resolveToken(Array.isArray(token) ? token[0] : token);
+    if (!session) return reply.code(401).send({ error: 'BAD_TOKEN' });
+    const role = await getActiveRole(session.user_id, req.params.docId);
+    if (!role || role.tenant_id !== session.tenant_id) {
+      return reply.code(403).send({ error: 'FORBIDDEN' });
+    }
+    if (role.role === 'reader') return reply.code(403).send({ error: 'READ_ONLY' });
+
+    // Validate BEFORE any write: invalid requests must leave no artifacts.
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (!title || title.length > 200) {
+      return reply.code(400).send({ error: 'BAD_TITLE' });
+    }
+
+    const room = await getRoom(req.params.docId);
+    const out = await copyDocument(room, {
+      title,
+      userId: session.user_id,
+      tenantId: session.tenant_id,
     });
     return out;
   });

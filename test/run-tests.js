@@ -690,13 +690,146 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 copy current document: identical hash at copy time, then independent
+// ---------------------------------------------------------------------------
+const t11 = test('T11 copy document: same hash at copy, then source/copy evolve independently', async () => {
+  await createDoc('t11', { writers: ['user-alice'], readers: ['user-carol'], owners: ['user-owner'] });
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  await a.connect();
+  for (let i = 0; i < 6; i++) {
+    a.localEdit((t) => t.insert(t.length, `s${i};`));
+    await a.flush();
+  }
+  await sleep(100);
+  // Compact the source first: the copy must come from the live room state
+  // (snapshot+tail), proving it is not a replay of the update log.
+  const c0 = await httpPost('/v1/docs/t11/compact', 'user-owner', { minUpdates: 1 });
+  assert.equal(JSON.parse(c0.body).compacted, true);
+
+  const srcBefore = await recovered('t11');
+  assert.equal(srcBefore.stateHash, a.stateHash());
+  const docsBefore = await sqlCount('documents');
+  const snapsBefore = await sqlCount('doc_snapshots');
+
+  // --- rejected requests leave no half-created artifacts ---
+  const denied = [
+    await httpPost('/v1/docs/t11/copy', 'user-carol', { title: 'reader copy' }), // reader
+    await httpPost('/v1/docs/t11/copy', 'user-nobody', { title: 'non-member' }), // non-member
+    await httpPost('/v1/docs/t11/copy', 'user-dave', { title: 'cross-tenant' }), // cross-tenant
+    await httpPost('/v1/docs/t11/copy', 'no-such-user', { title: 'ghost' }),     // bad token
+  ];
+  assert.deepEqual(denied.map((r) => r.status), [403, 403, 403, 401]);
+  assert.equal(JSON.parse(denied[0].body).error, 'READ_ONLY');
+  assert.equal(JSON.parse(denied[1].body).error, 'FORBIDDEN');
+  assert.equal(JSON.parse(denied[2].body).error, 'FORBIDDEN');
+  const invalid = [
+    await httpPost('/v1/docs/t11/copy', 'user-owner', { title: '' }),      // empty
+    await httpPost('/v1/docs/t11/copy', 'user-owner', { title: '   ' }),   // whitespace
+    await httpPost('/v1/docs/t11/copy', 'user-owner', {}),                 // missing
+    await httpPost('/v1/docs/t11/copy', 'user-owner', { title: 42 }),      // non-string
+  ];
+  assert.deepEqual(invalid.map((r) => r.status), [400, 400, 400, 400]);
+  assert.ok(invalid.every((r) => JSON.parse(r.body).error === 'BAD_TITLE'));
+  assert.equal(await sqlCount('documents'), docsBefore, 'no half-created documents');
+  assert.equal(await sqlCount('doc_snapshots'), snapsBefore, 'no half-created snapshots');
+
+  // --- the copy itself ---
+  const r = await httpPost('/v1/docs/t11/copy', 'user-owner', { title: '  T11 drill copy  ' });
+  assert.equal(r.status, 200);
+  const copy = JSON.parse(r.body);
+  assert.equal(copy.copied, true);
+  assert.ok(copy.docId && copy.docId !== 't11');
+  assert.equal(copy.title, 'T11 drill copy', 'title is trimmed');
+  assert.equal(copy.sourceDocId, 't11');
+  assert.equal(copy.stateHash, srcBefore.stateHash,
+    'copy hash must equal source hash at copy time');
+  // The source is untouched by the copy.
+  assert.equal((await recovered('t11')).stateHash, srcBefore.stateHash);
+
+  // Membership: the initiator is the sole owner of the copy; source
+  // memberships are unchanged and NOT carried over.
+  const members = (await db.query(
+    `SELECT user_id, role FROM document_members WHERE doc_id=$1`, [copy.docId],
+  )).rows;
+  assert.deepEqual(members, [{ user_id: 'user-owner', role: 'owner' }]);
+  assert.equal(await sqlCount('document_members',
+    `WHERE doc_id='t11' AND revoked_at IS NULL`), 3);
+  // No update history on the copy: exactly one initial snapshot at seq 0.
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id=$1`, [copy.docId]), 0);
+  const csnap = (await db.query(
+    `SELECT through_seq, update_count, state_hash FROM doc_snapshots WHERE doc_id=$1`,
+    [copy.docId],
+  )).rows;
+  assert.equal(csnap.length, 1);
+  assert.equal(Number(csnap[0].through_seq), 0);
+  assert.equal(Number(csnap[0].update_count), 0);
+  assert.equal(csnap[0].state_hash, srcBefore.stateHash);
+
+  // A script client connects to the copy and sees the same state hash.
+  const k = new DocClient({ url: WS_URL, token: 'user-owner', docId: copy.docId });
+  await k.connect();
+  assert.equal(k.role, 'owner');
+  assert.equal(k.stateHash(), srcBefore.stateHash);
+  assert.equal(k.text, a.text);
+  // A writer of the SOURCE has no access to the copy.
+  const intruder = new DocClient({ url: WS_URL, token: 'user-alice', docId: copy.docId });
+  await assert.rejects(intruder.connect(), /FORBIDDEN/);
+
+  // --- independent evolution: divergent edits on source and copy ---
+  a.localEdit((t) => t.insert(t.length, 'SRC-ONLY'));
+  await a.flush();
+  k.localEdit((t) => t.insert(t.length, 'COPY-ONLY'));
+  await k.flush();
+  await sleep(150);
+  assert.notEqual(a.stateHash(), k.stateHash());
+  assert.ok(a.text.includes('SRC-ONLY') && !a.text.includes('COPY-ONLY'));
+  assert.ok(k.text.includes('COPY-ONLY') && !k.text.includes('SRC-ONLY'));
+
+  // Compact both independently (destructive deleteFolded path on both).
+  const cs = await httpPost('/v1/docs/t11/compact', 'user-owner',
+    { minUpdates: 1, deleteFolded: true });
+  assert.equal(JSON.parse(cs.body).compacted, true);
+  const cc = await httpPost(`/v1/docs/${copy.docId}/compact`, 'user-owner',
+    { minUpdates: 1, deleteFolded: true });
+  assert.equal(JSON.parse(cc.body).compacted, true);
+
+  const srcHashPre = (await recovered('t11')).stateHash;
+  const copyHashPre = (await recovered(copy.docId)).stateHash;
+  assert.equal(srcHashPre, a.stateHash());
+  assert.equal(copyHashPre, k.stateHash());
+  assert.notEqual(srcHashPre, copyHashPre);
+
+  // Restart: each document recovers from its OWN snapshot+tail only.
+  await stopServer();
+  a.hardClose(); k.hardClose();
+  await startServer({ crashAfterCommit: false });
+
+  const srcAfter = await recovered('t11');
+  const copyAfter = await recovered(copy.docId);
+  assert.equal(srcAfter.stateHash, srcHashPre, 'source survives restart unchanged');
+  assert.equal(copyAfter.stateHash, copyHashPre, 'copy survives restart unchanged');
+  assert.ok(srcAfter.text.includes('SRC-ONLY') && !srcAfter.text.includes('COPY-ONLY'),
+    'no copy edits leaked into the source');
+  assert.ok(copyAfter.text.includes('COPY-ONLY') && !copyAfter.text.includes('SRC-ONLY'),
+    'no source edits leaked into the copy');
+
+  // Fresh clients after the restart converge on each document's own hash.
+  const a2 = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11' });
+  const k2 = new DocClient({ url: WS_URL, token: 'user-owner', docId: copy.docId });
+  await Promise.all([a2.connect(), k2.connect()]);
+  assert.equal(a2.stateHash(), srcHashPre);
+  assert.equal(k2.stateHash(), copyHashPre);
+  a2.close(); k2.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

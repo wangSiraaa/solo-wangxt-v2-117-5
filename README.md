@@ -77,6 +77,24 @@ hello 和 `sync-req` 都接受 Yjs 状态向量：服务器返回
 
 恢复永远走 `snapshot(through_seq=N)` + `updates(seq > N)`（T6）。
 
+### 复制当前文档（同租户演练起点）
+
+`POST /v1/docs/:docId/copy`（body：`{title}`）把源文档**当前一致的 Yjs 状态**
+复制成一个全新文档，用作同租户演练的起点，此后源文档的后续更新不会进入副本：
+
+1. 在源 room 的串行队列内编码实时 Y.Doc 全量状态（与压缩共用同一条
+   一致性防线：编码期间不会有更新插入）；
+2. 单事务写入：新 `documents` 行（同租户、请求提供的标题）+ 唯一成员
+   （发起者 = owner）+ 初始快照 `doc_snapshots(through_seq=0, update_count=0)`；
+3. **校验 1（提交前）**：仅用事务内刚写入的行重建，必须与源状态逐字节相等，
+   否则整体回滚，不留半成品；
+4. **校验 2（提交后）**：换一条池化连接走标准恢复路径再验一次——这正是
+   重启后加载副本时会走的路径。
+
+副本不搬运更新历史（`doc_updates` 为空）也不搬运原成员；标题为空等无效
+请求在任何写库之前就被 400 拒绝。复制后源与副本各自独立编辑、压缩、
+重启恢复，互不串改（T11）。
+
 ### 未知 / 损坏更新可定位
 
 无法解析的帧不会杀死进程，也不会污染文档，而是写入 `update_errors`：
@@ -96,7 +114,7 @@ error_code / error_message`。区分 `BAD_JSON`、`BAD_ENVELOPE`、`BAD_ENCODING
 * **每次更新**都重新查库校验 `(user, doc)` 成员关系与角色，不使用连接期缓存：
   会话中途被撤销的成员，下一条 update 立即 `FORBIDDEN`（T8）。
 * `reader` 可连接/同步，但写帧返回 `READ_ONLY`。
-* HTTP 管理端点（压缩、恢复探测）执行同一套租户/角色校验。
+* HTTP 管理端点（压缩、复制、恢复探测）执行同一套租户/角色校验。
 
 ---
 
@@ -159,6 +177,15 @@ curl -s -H 'x-auth-token: user-owner' \
   http://127.0.0.1:7777/v1/docs/doc-demo/recovered-state
 ```
 
+复制当前文档作为演练起点（副本只有发起者一个 owner，可连接并核对哈希）：
+
+```bash
+npm run demo:copy
+# 或手动：curl -X POST -H 'x-auth-token: user-owner' \
+#   -H 'content-type: application/json' -d '{"title":"演练副本"}' \
+#   http://127.0.0.1:7777/v1/docs/doc-demo/copy
+```
+
 种子身份（demo 用，用户 id 即 bearer token）：
 
 | 用户 | 租户 | 对 doc-demo 的角色 |
@@ -191,6 +218,7 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 复制当前文档：复制时源/副本哈希相同；副本仅发起者一个 owner、无更新历史；reader/非成员/跨租户/空标题全部被拒且不留半成品；源与副本随后分别编辑、压缩（含物理删除）、重启恢复互不串改 |
 
 ---
 
@@ -205,12 +233,14 @@ src/yutil.js             Yjs 文档/状态向量/差异/校验/恢复
 src/room.js              每文档内存房间（串行队列 + 从快照+尾部加载）
 src/update-service.js    鉴权→校验→去重持久化→应用→广播→ack（含崩溃注入开关）
 src/compaction.js        压缩、双重一致性校验、存储恢复
+src/copy.js              复制当前文档为新文档（初始快照 + 唯一 owner）
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
 src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
 scripts/client-a.js      演示客户端 A
 scripts/client-b.js      演示客户端 B
+scripts/client-copy.js   复制演示：创建副本、连接副本并打印状态哈希
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```
